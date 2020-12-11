@@ -35,18 +35,17 @@
 #endif
 #endif
 
+#include <any>
 #include <list>
 #include <memory>
-#include <optional>
 #include <type_traits>
 
 namespace lazy {
-
    class _Base : public std::enable_shared_from_this<_Base> {
       /**
        * 重置当前节点
        */
-      virtual void release() = 0;
+      virtual void release(){};
 
    public:
       /**
@@ -69,30 +68,101 @@ namespace lazy {
       std::list<std::weak_ptr<_Base>> downstream;
    };
 
-   template<typename Type>
-   class _Root : public _Base {
-      std::optional<Type> value;
+   class _DataBase : public _Base {
+   public:
+      virtual void load(std::any) = 0;
+      virtual std::any dump() = 0;
+   };
 
+   using Snapshot = std::list<std::tuple<std::weak_ptr<_DataBase>, std::any>>;
+   /**
+    * Graph用于restore各个node中的数据
+    */
+   struct Graph {
+      // std::any will store std::shared_ptr<T> for any T
+      std::list<std::weak_ptr<_DataBase>> nodes;
+
+      Snapshot dump() {
+         auto result = Snapshot();
+         for (auto iter = nodes.begin(); iter != nodes.end();) {
+            if (auto ptr = iter->lock(); ptr) {
+               result.push_back(std::make_tuple(*iter, ptr->dump()));
+               ++iter;
+            } else {
+               iter = nodes.erase(iter);
+            }
+         }
+         return result;
+      }
+      void load(Snapshot& snapshot) {
+         for (auto iter = snapshot.begin(); iter != snapshot.end();) {
+            auto& [weak, value] = *iter;
+            if (auto ptr = weak.lock(); ptr) {
+               ptr->load(value);
+               ++iter;
+            } else {
+               iter = snapshot.erase(iter);
+            }
+         }
+      }
+
+      template<typename T>
+      void add(T value) {
+         nodes.push_back(std::dynamic_pointer_cast<_DataBase>(value));
+      }
+   };
+
+   inline Graph default_graph = Graph();
+   inline Graph* current_graph = &default_graph;
+
+   template<typename Type>
+   class _DataNode : public _DataBase {
       void release() override {
          value.reset();
       }
 
+   protected:
+      std::shared_ptr<Type> value;
+
    public:
+      void load(std::any v) override {
+         value = std::any_cast<std::shared_ptr<Type>>(v);
+      }
+
+      std::any dump() override {
+         return std::any(value);
+      }
+   };
+
+   template<typename Derived>
+   class _Common {
+   public:
+      auto operator*() {
+         return static_cast<Derived*>(this)->Derived::get();
+      }
+   };
+
+   template<typename Type>
+   class _Root : public _DataNode<Type>, public _Common<_Root<Type>> {
+   public:
+      _Root(const Type& v) {
+         set(v);
+      }
       _Root(Type&& v) {
          set(std::move(v));
       }
 
       const Type& get() {
-         return *value;
+         return *(this->value);
       }
 
       void set(const Type& v) {
-         unset();
-         value = v;
+         this->unset();
+         this->value = v;
       }
       void set(Type&& v) {
-         unset();
-         value = std::move(v);
+         this->unset();
+         this->value.reset(new Type(std::move(v)));
       }
 
       // 下面是一些非正交函数
@@ -105,18 +175,18 @@ namespace lazy {
          set(std::move(v));
          return *this;
       }
-
-      const Type& operator*() {
-         return get();
-      }
    };
    template<typename Type>
    auto Root(const Type& v) {
-      return std::make_shared<_Root<Type>>(v);
+      auto result = std::make_shared<_Root<Type>>(v);
+      current_graph->add(result);
+      return result;
    }
    template<typename Type>
    auto Root(Type&& v) {
-      return std::make_shared<_Root<Type>>(std::move(v));
+      auto result = std::make_shared<_Root<Type>>(std::move(v));
+      current_graph->add(result);
+      return result;
    }
 
    template<typename CreateFunction, typename... Args>
@@ -125,30 +195,21 @@ namespace lazy {
    }
 
    template<typename Function>
-   class _Node : public _Base {
+   class _Node : public _DataNode<std::invoke_result_t<Function>>, public _Common<_Node<Function>> {
       using Type = std::invoke_result_t<Function>;
-      std::optional<Type> value;
+
       // Function is ()=>Type
       Function function;
 
-      void release() override {
-         value.reset();
-      }
-
    public:
       const Type& get() {
-         if (!value.has_value()) {
-            value = function();
+         if (!bool(this->value)) {
+            this->value.reset(new Type(function()));
          }
-         return *value;
+         return *(this->value);
       }
 
       _Node(Function&& f) : function(std::move(f)) {}
-
-      // 下面是一些非正交函数
-      const Type& operator*() {
-         return get();
-      }
    };
 
    template<typename CreateFunction, typename... Args>
@@ -156,16 +217,15 @@ namespace lazy {
       auto f = function_wrapper(function, args...);
       auto result = std::make_shared<_Node<decltype(f)>>(std::move(f));
       (args->downstream.push_back(result->shared_from_this()), ...);
+      current_graph->add(result);
       return result;
    }
 
    template<typename Function>
-   class _Path : public _Base {
+   class _Path : public _Base, public _Common<_Path<Function>> {
       using Type = std::invoke_result_t<Function>;
       // Function is ()=>Type
       Function function;
-
-      void release() override {}
 
    public:
       Type get() {
@@ -173,11 +233,6 @@ namespace lazy {
       }
 
       _Path(Function&& f) : function(std::move(f)) {}
-
-      // 下面是一些非正交函数
-      const Type& operator*() {
-         return get();
-      }
    };
    template<typename CreateFunction, typename... Args>
    auto Path(CreateFunction&& function, Args&... args) {
