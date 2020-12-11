@@ -38,16 +38,24 @@
 #include <any>
 #include <list>
 #include <memory>
+#include <tuple>
 #include <type_traits>
 
 namespace lazy {
-   class _Base : public std::enable_shared_from_this<_Base> {
+   // shared -> lazy_base
+   //                 -> data_lazy_base -> typed_data_lazy_base
+   //                 -> function_lazy_base -> typed_data_lazy_base
+   // 一个需要有一个init函数
+   // 因为shared_from_this cannot be called from ctor
+   class lazy_base : public virtual std::enable_shared_from_this<lazy_base> {
       /**
        * 重置当前节点
        */
       virtual void release(){};
 
    public:
+      std::list<std::weak_ptr<lazy_base>> downstream;
+
       /**
        * 重置当前节点和下游
        */
@@ -64,23 +72,125 @@ namespace lazy {
             }
          }
       }
-
-      std::list<std::weak_ptr<_Base>> downstream;
    };
 
-   class _DataBase : public _Base {
+   class data_lazy_base : public virtual lazy_base {
    public:
+      /**
+       * 从一个any中load出数据
+       */
       virtual void load(std::any) = 0;
+      /**
+       * dump出一个any数据
+       */
       virtual std::any dump() = 0;
    };
 
-   using Snapshot = std::list<std::tuple<std::weak_ptr<_DataBase>, std::any>>;
+   class function_lazy_base : public virtual lazy_base {};
+
+   template<typename Type>
+   class typed_data_lazy_base : public virtual data_lazy_base {
+      // data lazy的release应reset掉value
+      void release() override {
+         value.reset();
+      }
+
+   protected:
+      std::shared_ptr<Type> value;
+
+   public:
+      void load(std::any v) override {
+         value = std::any_cast<std::shared_ptr<Type>>(v);
+      }
+
+      std::any dump() override {
+         return std::any(value);
+      }
+
+      void set(Type&& v) {
+         unset();
+         value.reset(new Type(std::move(v)));
+      }
+      void set(const Type& v) {
+         unset();
+         value.reset(new Type(v));
+      }
+   };
+
+   template<typename Function>
+   class typed_function_lazy_base : public virtual function_lazy_base {
+   protected:
+      Function function;
+
+   public:
+      using Type = std::invoke_result_t<Function>;
+
+      typed_function_lazy_base(Function&& f) : function(std::move(f)) {}
+   };
+
+   template<typename Type>
+   struct root : typed_data_lazy_base<Type> {
+      using typed_data_lazy_base<Type>::value;
+      using typed_data_lazy_base<Type>::set;
+
+      const Type& get() {
+         return *value;
+      }
+      const Type& operator*() {
+         return get();
+      }
+
+      root<Type>& operator=(const Type& v) {
+         set(v);
+         return *this;
+      }
+      root<Type>& operator=(Type&& v) {
+         set(std::move(v));
+         return *this;
+      }
+   };
+
+   template<typename Function>
+   struct path : typed_function_lazy_base<Function> {
+      using typename typed_function_lazy_base<Function>::Type;
+      using typed_function_lazy_base<Function>::function;
+      using typed_function_lazy_base<Function>::typed_function_lazy_base;
+
+      Type get() {
+         return function();
+      }
+      const Type& operator*() {
+         return get();
+      }
+   };
+
+   template<typename Function>
+   struct node : typed_function_lazy_base<Function>, typed_data_lazy_base<typename typed_function_lazy_base<Function>::Type> {
+      using typename typed_function_lazy_base<Function>::Type;
+      using typed_data_lazy_base<Type>::value;
+      using typed_data_lazy_base<Type>::set;
+      using typed_function_lazy_base<Function>::function;
+      using typed_function_lazy_base<Function>::typed_function_lazy_base;
+
+      const Type& get() {
+         if (!bool(value)) {
+            set(function());
+         }
+         return *value;
+      }
+      const Type& operator*() {
+         return get();
+      }
+   };
+   // graph
+
+   using Snapshot = std::list<std::tuple<std::weak_ptr<data_lazy_base>, std::any>>;
    /**
     * Graph用于restore各个node中的数据
     */
    struct Graph {
       // std::any will store std::shared_ptr<T> for any T
-      std::list<std::weak_ptr<_DataBase>> nodes;
+      std::list<std::weak_ptr<data_lazy_base>> nodes;
 
       Snapshot dump() {
          auto result = Snapshot();
@@ -108,136 +218,48 @@ namespace lazy {
 
       template<typename T>
       void add(T value) {
-         nodes.push_back(std::dynamic_pointer_cast<_DataBase>(value));
+         nodes.push_back(std::dynamic_pointer_cast<data_lazy_base>(value));
       }
    };
 
    inline Graph default_graph = Graph();
-   inline Graph* current_graph = &default_graph;
-
-   template<typename Type>
-   class _DataNode : public _DataBase {
-      void release() override {
-         value.reset();
-      }
-
-   protected:
-      std::shared_ptr<Type> value;
-
-   public:
-      void load(std::any v) override {
-         value = std::any_cast<std::shared_ptr<Type>>(v);
-      }
-
-      std::any dump() override {
-         return std::any(value);
-      }
-   };
-
-   template<typename Derived>
-   class _Common {
-   public:
-      auto operator*() {
-         return static_cast<Derived*>(this)->Derived::get();
-      }
-   };
-
-   template<typename Type>
-   class _Root : public _DataNode<Type>, public _Common<_Root<Type>> {
-   public:
-      _Root(const Type& v) {
-         set(v);
-      }
-      _Root(Type&& v) {
-         set(std::move(v));
-      }
-
-      const Type& get() {
-         return *(this->value);
-      }
-
-      void set(const Type& v) {
-         this->unset();
-         this->value = v;
-      }
-      void set(Type&& v) {
-         this->unset();
-         this->value.reset(new Type(std::move(v)));
-      }
-
-      // 下面是一些非正交函数
-
-      _Root<Type>& operator=(const Type& v) {
-         set(v);
-         return *this;
-      }
-      _Root<Type>& operator=(Type&& v) {
-         set(std::move(v));
-         return *this;
-      }
-   };
-   template<typename Type>
-   auto Root(const Type& v) {
-      auto result = std::make_shared<_Root<Type>>(v);
-      current_graph->add(result);
-      return result;
+   inline Graph* active_graph = &default_graph;
+   inline Graph& get_graph() {
+      return *active_graph;
    }
+   inline void set_graph(Graph& graph) {
+      active_graph = &graph;
+   }
+
+   // helper function
+
+   template<typename Function, typename... Args>
+   auto function_wrapper(Function&& function, Args&... args) {
+      return [=] { return function(args->get()...); };
+   }
+
    template<typename Type>
    auto Root(Type&& v) {
-      auto result = std::make_shared<_Root<Type>>(std::move(v));
-      current_graph->add(result);
+      using RealType = std::remove_cv_t<std::remove_reference_t<Type>>;
+      auto result = std::make_shared<root<RealType>>();
+      result->set(std::forward<Type>(v));
+      active_graph->add(result);
       return result;
    }
 
-   template<typename CreateFunction, typename... Args>
-   auto function_wrapper(CreateFunction&& function, Args&... args) {
-      return [=]() { return function(args->get()...); };
-   }
-
-   template<typename Function>
-   class _Node : public _DataNode<std::invoke_result_t<Function>>, public _Common<_Node<Function>> {
-      using Type = std::invoke_result_t<Function>;
-
-      // Function is ()=>Type
-      Function function;
-
-   public:
-      const Type& get() {
-         if (!bool(this->value)) {
-            this->value.reset(new Type(function()));
-         }
-         return *(this->value);
-      }
-
-      _Node(Function&& f) : function(std::move(f)) {}
-   };
-
-   template<typename CreateFunction, typename... Args>
-   auto Node(CreateFunction&& function, Args&... args) {
+   template<typename Function, typename... Args>
+   auto Node(Function&& function, Args&... args) {
       auto f = function_wrapper(function, args...);
-      auto result = std::make_shared<_Node<decltype(f)>>(std::move(f));
+      auto result = std::make_shared<node<decltype(f)>>(std::move(f));
       (args->downstream.push_back(result->shared_from_this()), ...);
-      current_graph->add(result);
+      active_graph->add(result);
       return result;
    }
 
-   template<typename Function>
-   class _Path : public _Base, public _Common<_Path<Function>> {
-      using Type = std::invoke_result_t<Function>;
-      // Function is ()=>Type
-      Function function;
-
-   public:
-      Type get() {
-         return function();
-      }
-
-      _Path(Function&& f) : function(std::move(f)) {}
-   };
-   template<typename CreateFunction, typename... Args>
-   auto Path(CreateFunction&& function, Args&... args) {
+   template<typename Function, typename... Args>
+   auto Path(Function&& function, Args&... args) {
       auto f = function_wrapper(function, args...);
-      auto result = std::make_shared<_Path<decltype(f)>>(std::move(f));
+      auto result = std::make_shared<path<decltype(f)>>(std::move(f));
       (args->downstream.push_back(result->shared_from_this()), ...);
       return result;
    }
