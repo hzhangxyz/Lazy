@@ -46,7 +46,7 @@ namespace lazy {
     * \defgroup Lazy
     * @{
     */
-   struct lazy_base : public std::enable_shared_from_this<lazy_base> {
+   struct lazy_base : std::enable_shared_from_this<lazy_base> {
    private:
       /**
        * 重置当前节点
@@ -77,7 +77,7 @@ namespace lazy {
       virtual ~lazy_base() {}
    };
 
-   struct data_lazy_base : public lazy_base {
+   struct data_lazy_base : lazy_base {
    public:
       /**
        * 从一个any中load出数据
@@ -90,18 +90,17 @@ namespace lazy {
    };
 
    template<typename Function>
-   struct path : public lazy_base {
+   struct path : lazy_base {
    private:
       Function function;
 
-      void release() override{};
+      void release() override {}
 
    public:
-      const auto& get() {
-         const auto& result = function();
-         return result;
+      decltype(auto) get() {
+         return function();
       }
-      const auto& operator*() {
+      decltype(auto) operator*() {
          return get();
       }
 
