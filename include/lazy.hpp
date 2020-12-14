@@ -42,20 +42,18 @@
 #include <type_traits>
 
 namespace lazy {
-   // shared -> lazy_base
-   //                 -> data_lazy_base -> typed_data_lazy_base
-   //                 -> function_lazy_base -> typed_data_lazy_base
-   // 一个需要有一个init函数
-   // 因为shared_from_this cannot be called from ctor
-   class lazy_base : public virtual std::enable_shared_from_this<lazy_base> {
+   /**
+    * \defgroup Lazy
+    * @{
+    */
+   struct lazy_base : public std::enable_shared_from_this<lazy_base> {
+   private:
       /**
        * 重置当前节点
        */
-      virtual void release(){};
+      virtual void release() = 0;
 
-   public:
-      std::list<std::weak_ptr<lazy_base>> downstream;
-
+   protected:
       /**
        * 重置当前节点和下游
        */
@@ -72,9 +70,14 @@ namespace lazy {
             }
          }
       }
+
+   public:
+      std::list<std::weak_ptr<lazy_base>> downstream;
+
+      virtual ~lazy_base() {}
    };
 
-   class data_lazy_base : public virtual lazy_base {
+   struct data_lazy_base : public lazy_base {
    public:
       /**
        * 从一个any中load出数据
@@ -86,53 +89,40 @@ namespace lazy {
       virtual std::any dump() = 0;
    };
 
-   class function_lazy_base : public virtual lazy_base {};
+   template<typename Function>
+   struct path : public lazy_base {
+   private:
+      Function function;
+
+      void release() override{};
+
+   public:
+      const auto& get() {
+         const auto& result = function();
+         return result;
+      }
+      const auto& operator*() {
+         return get();
+      }
+
+      path(Function&& f) : function(std::move(f)) {}
+      path() = delete;
+      path(const path&) = delete;
+      path(path&&) = delete;
+      path& operator=(const path<Function>&) = delete;
+      path& operator=(path<Function>&&) = delete;
+   };
 
    template<typename Type>
-   class typed_data_lazy_base : public virtual data_lazy_base {
-      // data lazy的release应reset掉value
+   struct root : data_lazy_base {
+   private:
+      std::shared_ptr<const Type> value;
+
       void release() override {
          value.reset();
       }
 
-   protected:
-      std::shared_ptr<Type> value;
-
    public:
-      void load(std::any v) override {
-         value = std::any_cast<std::shared_ptr<Type>>(v);
-      }
-
-      std::any dump() override {
-         return std::any(value);
-      }
-
-      void set(Type&& v) {
-         unset();
-         value.reset(new Type(std::move(v)));
-      }
-      void set(const Type& v) {
-         unset();
-         value.reset(new Type(v));
-      }
-   };
-
-   template<typename Function>
-   class typed_function_lazy_base : public virtual function_lazy_base {
-   protected:
-      Function function;
-
-   public:
-      using Type = std::invoke_result_t<Function>;
-
-      typed_function_lazy_base(Function&& f) : function(std::move(f)) {}
-   };
-
-   template<typename Type>
-   struct root : typed_data_lazy_base<Type> {
-      using typed_data_lazy_base<Type>::value;
-      using typed_data_lazy_base<Type>::set;
-
       const Type& get() {
          return *value;
       }
@@ -148,38 +138,75 @@ namespace lazy {
          set(std::move(v));
          return *this;
       }
+
+      void load(std::any v) override {
+         value = std::any_cast<std::shared_ptr<const Type>>(v);
+      }
+
+      std::any dump() override {
+         return std::any(value);
+      }
+
+      void set(Type&& v) {
+         unset();
+         value.reset(new Type(std::move(v)));
+      }
+      void set(const Type& v) {
+         unset();
+         value.reset(new Type(v));
+      }
+
+      root() = default;
+      root(const root&) = delete;
+      root(root&&) = delete;
+      root& operator=(const root<Type>&) = delete;
+      root& operator=(root<Type>&&) = delete;
    };
 
    template<typename Function>
-   struct path : typed_function_lazy_base<Function> {
-      using typename typed_function_lazy_base<Function>::Type;
-      using typed_function_lazy_base<Function>::function;
-      using typed_function_lazy_base<Function>::typed_function_lazy_base;
+   struct node : data_lazy_base {
+   private:
+      Function function;
+      using Type = std::remove_cv_t<std::remove_reference_t<std::invoke_result_t<Function>>>;
+      std::shared_ptr<const Type> value;
 
-      Type get() {
-         return function();
+      void release() override {
+         value.reset();
       }
-      const Type& operator*() {
-         return get();
+
+      void set(Type&& v) {
+         unset();
+         value.reset(new Type(std::move(v)));
       }
-   };
+      void set(const Type& v) {
+         unset();
+         value.reset(new Type(v));
+      }
 
-   template<typename Function>
-   struct node : typed_function_lazy_base<Function>, typed_data_lazy_base<typename typed_function_lazy_base<Function>::Type> {
-      using typename typed_function_lazy_base<Function>::Type;
-      using typed_data_lazy_base<Type>::value;
-      using typed_data_lazy_base<Type>::set;
-      using typed_function_lazy_base<Function>::function;
-      using typed_function_lazy_base<Function>::typed_function_lazy_base;
-
-      const Type& get() {
+   public:
+      const auto& get() {
          if (!bool(value)) {
             set(function());
          }
          return *value;
       }
-      const Type& operator*() {
+      const auto& operator*() {
          return get();
+      }
+
+      node(Function&& f) : function(std::move(f)) {}
+      node() = delete;
+      node(const node&) = delete;
+      node(node&&) = delete;
+      node& operator=(const node<Function>&) = delete;
+      node& operator=(node<Function>&&) = delete;
+
+      void load(std::any v) override {
+         value = std::any_cast<std::shared_ptr<const Type>>(v);
+      }
+
+      std::any dump() override {
+         return std::any(value);
       }
    };
    // graph
@@ -222,12 +249,12 @@ namespace lazy {
       }
    };
 
-   inline Graph default_graph = Graph();
+   inline Graph default_graph;
    inline Graph* active_graph = &default_graph;
-   inline Graph& get_graph() {
+   inline Graph& current_graph() {
       return *active_graph;
    }
-   inline void set_graph(Graph& graph) {
+   inline void use_graph(Graph& graph) {
       active_graph = &graph;
    }
 
@@ -239,11 +266,19 @@ namespace lazy {
    }
 
    template<typename Type>
+   auto Root() {
+      using RealType = std::remove_cv_t<std::remove_reference_t<Type>>;
+      auto result = std::make_shared<root<RealType>>();
+      current_graph().add(result);
+      return result;
+   }
+
+   template<typename Type>
    auto Root(Type&& v) {
       using RealType = std::remove_cv_t<std::remove_reference_t<Type>>;
       auto result = std::make_shared<root<RealType>>();
       result->set(std::forward<Type>(v));
-      active_graph->add(result);
+      current_graph().add(result);
       return result;
    }
 
@@ -252,7 +287,7 @@ namespace lazy {
       auto f = function_wrapper(function, args...);
       auto result = std::make_shared<node<decltype(f)>>(std::move(f));
       (args->downstream.push_back(result->shared_from_this()), ...);
-      active_graph->add(result);
+      current_graph().add(result);
       return result;
    }
 
@@ -263,6 +298,7 @@ namespace lazy {
       (args->downstream.push_back(result->shared_from_this()), ...);
       return result;
    }
+   /**@}*/
 } // namespace lazy
 
 #endif
