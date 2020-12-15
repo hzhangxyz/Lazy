@@ -54,7 +54,7 @@ namespace lazy {
        */
       virtual void release() = 0;
 
-   public:
+   protected:
       /**
        * 重置当前节点和下游
        */
@@ -70,6 +70,7 @@ namespace lazy {
          }
       }
 
+   public:
       /**
        * 下游节点的列表
        */
@@ -125,15 +126,6 @@ namespace lazy {
          return *value;
       }
 
-      root<Type>& operator=(const Type& v) {
-         set(v);
-         return *this;
-      }
-      root<Type>& operator=(Type&& v) {
-         set(std::move(v));
-         return *this;
-      }
-
       void load(std::any v) override {
          value = std::any_cast<std::shared_ptr<const Type>>(v);
       }
@@ -141,6 +133,8 @@ namespace lazy {
       std::any dump() override {
          return std::any(value);
       }
+
+      using lazy_base::unset;
 
       void set(Type&& v) {
          unset();
@@ -215,7 +209,7 @@ namespace lazy {
          auto result = Snapshot();
          for (auto iter = nodes.begin(); iter != nodes.end();) {
             if (auto ptr = iter->lock(); ptr) {
-               result.push_back(std::make_tuple(*iter, ptr->dump()));
+               result.emplace_back(*iter, ptr->dump());
                ++iter;
             } else {
                iter = nodes.erase(iter);
@@ -246,7 +240,7 @@ namespace lazy {
    inline Graph& current_graph() {
       return *active_graph;
    }
-   inline void use_graph(Graph& graph) {
+   inline void use_graph(Graph& graph = default_graph) {
       active_graph = &graph;
    }
 
@@ -276,7 +270,7 @@ namespace lazy {
 
    template<typename Function, typename... Args>
    auto Node(Function&& function, Args&... args) {
-      // 应该返回一个值而非引用
+      // 应该返回一个值而非引用, 否则无法放入shared_ptr中
       auto f = function_wrapper(function, args...);
       using Type = typename decltype(f)::result_type;
       auto result = std::make_shared<node<Type>>(std::move(f));
